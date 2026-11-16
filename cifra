@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.exceptions import InvalidTag
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 CHUNK_SIZE = 64 * 1024
 MAGIC_HEADER = b'ENC2'
@@ -38,7 +38,6 @@ def print_progress(current, total, bar_length=40, _state=[0.0]):
     _state[0] = current_time
 
     if total == 0:
-        # Stream mode: Unknown total size
         mb = current / (1024 * 1024)
         sys.stderr.write(f'\rProgress: {mb:.2f} MB processed')
     else:
@@ -65,13 +64,44 @@ def get_target_size(path, excludes):
     
     total = 0
     for dirpath, dirnames, filenames in os.walk(path):
-        # Prune directories in place so os.walk ignores them entirely
         dirnames[:] = [d for d in dirnames if not should_exclude(os.path.join(dirpath, d), excludes)]
         for f in filenames:
             fp = os.path.join(dirpath, f)
             if not should_exclude(fp, excludes):
                 total += os.lstat(fp).st_size
     return total
+
+def validate_output_path(out_path, source_path=None, force=False):
+    """Validates output path against symlinks, source clobbering, and overwrites."""
+    if os.path.islink(out_path):
+        log(f"Error: refusing to write to symbolic link '{out_path}'.")
+        sys.exit(1)
+
+    if source_path and os.path.realpath(source_path) == os.path.realpath(out_path):
+        log(f"Error: output path '{out_path}' resolves to the same file as the source.")
+        sys.exit(1)
+
+    if os.path.exists(out_path) and not force:
+        if not sys.stdin.isatty():
+            log(f"Error: '{out_path}' exists. Use -f to overwrite in non-interactive mode.")
+            sys.exit(1)
+        ans = input(f"\nWarning: '{out_path}' already exists. Overwrite? [y/N]: ").strip().lower()
+        if ans not in ['y', 'yes']:
+            log("Operation aborted.")
+            sys.exit(0)
+
+def create_secure_temp_file(out_path):
+    """Creates an atomic temporary file in the target directory with 0600 permissions."""
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    fd, tmp_path = tempfile.mkstemp(prefix=".cifra_", suffix=".tmp", dir=out_dir)
+    try:
+        os.chmod(tmp_path, 0o600)
+        return os.fdopen(fd, 'wb'), tmp_path
+    except Exception:
+        os.close(fd)
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 class EncryptingStream:
     def __init__(self, out_f, encryptor, total_size):
@@ -107,7 +137,7 @@ def get_password_bytes(args, is_confirm_needed=False):
             sys.exit(1)
     else:
         prompt = "Enter password to encrypt: " if is_confirm_needed else "Enter password to decrypt: "
-        pwd1 = getpass.getpass(prompt) # getpass reads from /dev/tty, safe from pipes
+        pwd1 = getpass.getpass(prompt)
         if not pwd1:
             log("Error: password cannot be empty.")
             sys.exit(1)
@@ -147,23 +177,17 @@ def main():
             total_size = 0
             out_path = args.output
             tmp_path = None
-            f_out = open(out_path, 'wb') if out_path else sys.stdout.buffer
+            if out_path:
+                validate_output_path(out_path, source_path=None, force=args.force)
+                f_out, tmp_path = create_secure_temp_file(out_path)
+            else:
+                f_out = sys.stdout.buffer
         else:
             is_dir = os.path.isdir(target)
             out_path = args.output or (target + ".enc")
+            validate_output_path(out_path, source_path=target, force=args.force)
             total_size = get_target_size(target, args.exclude)
-            
-            if os.path.exists(out_path) and not args.force:
-                if not sys.stdin.isatty():
-                    log(f"Error: '{out_path}' exists. Use -f to overwrite in non-interactive mode.")
-                    sys.exit(1)
-                ans = input(f"\nWarning: '{out_path}' already exists. Overwrite? [y/N]: ").strip().lower()
-                if ans not in ['y', 'yes']:
-                    log("Operation aborted.")
-                    sys.exit(0)
-            
-            tmp_path = out_path + ".tmp"
-            f_out = open(tmp_path, 'wb')
+            f_out, tmp_path = create_secure_temp_file(out_path)
 
         pwd_bytes = get_password_bytes(args, is_confirm_needed=True)
 
@@ -176,7 +200,6 @@ def main():
         encryptor = cipher.encryptor()
 
         try:
-            # POINT 3: Header Authentication (AAD)
             header = struct.pack(HEADER_FORMAT, MAGIC_HEADER, 1 if is_dir else 0, scrypt_n, scrypt_r, scrypt_p, salt, nonce)
             encryptor.authenticate_additional_data(header)
             f_out.write(header)
@@ -221,8 +244,8 @@ def main():
         spool_file_path = None
         
         if is_stream:
-            # Spooling is necessary for streams because GCM requires the tag from the EOF before starting decryption
-            fd, spool_file_path = tempfile.mkstemp(prefix="cifra_spool_")
+            fd, spool_file_path = tempfile.mkstemp(prefix=".cifra_spool_")
+            os.chmod(spool_file_path, 0o600)
             spool_f = os.fdopen(fd, 'wb')
             sys.stderr.write("Spooling stdin stream to temporary file for GCM tag verification...\n")
             while True:
@@ -237,100 +260,89 @@ def main():
                 log(f"Error: target '{target_path}' must be a file.")
                 sys.exit(1)
 
-        file_size = os.path.getsize(target_path)
-        if file_size < HEADER_SIZE + 16:
-            log("Error: file is too small to contain valid encrypted data.")
-            if spool_file_path: os.remove(spool_file_path)
-            sys.exit(1)
-
-        with open(target_path, 'rb') as f_in:
-            header_data = f_in.read(HEADER_SIZE)
-            magic, flag_is_dir, n, r, p, salt, nonce = struct.unpack(HEADER_FORMAT, header_data)
-            
-            if magic == b'ENC1':
-                log("Error: file created with an older version. Use the previous script.")
-                sys.exit(1)
-            elif magic != MAGIC_HEADER:
-                log("Error: invalid signature. The file was not encrypted with this program.")
-                sys.exit(1)
-
-            if not (n > 0 and (n & (n - 1)) == 0) or not (16384 <= n <= 1048576) or not (1 <= r <= 16) or not (1 <= p <= 4):
-                log("Error: Scrypt parameters out of bounds (corrupted or tampered).")
-                sys.exit(1)
-
-        out_path = args.output
-        tmp_path = None
-        
-        if is_stream and not out_path:
-            f_out = sys.stdout.buffer
-        else:
-            if not out_path:
-                if target.endswith('.enc'): base_out = target[:-4]
-                else: base_out = target + ".dec"
-                out_path = base_out + (".tar" if flag_is_dir == 1 and not base_out.endswith(".tar") else "")
-                
-            if os.path.exists(out_path) and not args.force:
-                if not sys.stdin.isatty():
-                    log(f"Error: '{out_path}' exists. Use -f to overwrite in non-interactive mode.")
-                    sys.exit(1)
-                ans = input(f"\nWarning: '{out_path}' already exists. Overwrite? [y/N]: ").strip().lower()
-                if ans not in ['y', 'yes']:
-                    log("Operation aborted.")
-                    sys.exit(0)
-                    
-            tmp_path = out_path + ".tmp"
-            f_out = open(tmp_path, 'wb')
-
-        pwd_bytes = get_password_bytes(args, is_confirm_needed=False)
-
         try:
-            with open(target_path, 'rb') as f_in:
-                f_in.seek(-16, os.SEEK_END)
-                tag = f_in.read(16)
-                
-                f_in.seek(HEADER_SIZE)
-                
-                key = get_key(pwd_bytes, salt, n, r, p)
-                cipher = Cipher(algorithms.AES(key), modes.GCM(nonce, tag))
-                decryptor = cipher.decryptor()
-                
-                # POINT 3: Header Authentication (AAD)
-                decryptor.authenticate_additional_data(header_data)
+            file_size = os.path.getsize(target_path)
+            if file_size < HEADER_SIZE + 16:
+                log("Error: file is too small to contain valid encrypted data.")
+                sys.exit(1)
 
-                total_data = file_size - HEADER_SIZE - 16
-                bytes_left = total_data
-                processed = 0
+            with open(target_path, 'rb') as f_in:
+                header_data = f_in.read(HEADER_SIZE)
+                magic, flag_is_dir, n, r, p, salt, nonce = struct.unpack(HEADER_FORMAT, header_data)
                 
-                while bytes_left > 0:
-                    chunk_size = min(CHUNK_SIZE, bytes_left)
-                    chunk = f_in.read(chunk_size)
-                    f_out.write(decryptor.update(chunk))
-                    processed += len(chunk)
-                    bytes_left -= len(chunk)
-                    print_progress(processed, total_data)
-                    
-                sys.stderr.write('\n')
-                decryptor.finalize()
-                
-            if f_out is not sys.stdout.buffer:
-                f_out.close()
-                
-            if tmp_path:
-                os.replace(tmp_path, out_path)
-                log(f"Decryption completed. Restored: '{out_path}'")
-                if flag_is_dir == 1:
-                    log(f"Note: the original target was a directory. It has been restored as archive '{out_path}'.")
+                if magic == b'ENC1':
+                    log("Error: file created with an older version. Use the previous script.")
+                    sys.exit(1)
+                elif magic != MAGIC_HEADER:
+                    log("Error: invalid signature. The file was not encrypted with this program.")
+                    sys.exit(1)
+
+                if not (n > 0 and (n & (n - 1)) == 0) or not (16384 <= n <= 1048576) or not (1 <= r <= 16) or not (1 <= p <= 4):
+                    log("Error: Scrypt parameters out of bounds (corrupted or tampered).")
+                    sys.exit(1)
+
+            out_path = args.output
+            tmp_path = None
             
-        except InvalidTag:
-            if f_out is not sys.stdout.buffer and not f_out.closed: f_out.close()
-            if tmp_path and os.path.exists(tmp_path): os.remove(tmp_path)
-            log("\nAccess denied: incorrect password/keyfile, or tampered file (Header/Data corrupted).")
-            sys.exit(1)
-        except (Exception, KeyboardInterrupt) as e:
-            if f_out is not sys.stdout.buffer and not f_out.closed: f_out.close()
-            if tmp_path and os.path.exists(tmp_path): os.remove(tmp_path)
-            log(f"\nDecryption aborted: {e}")
-            sys.exit(1)
+            if is_stream and not out_path:
+                f_out = sys.stdout.buffer
+            else:
+                if not out_path:
+                    if target.endswith('.enc'): base_out = target[:-4]
+                    else: base_out = target + ".dec"
+                    out_path = base_out + (".tar" if flag_is_dir == 1 and not base_out.endswith(".tar") else "")
+                    
+                validate_output_path(out_path, source_path=(None if is_stream else target_path), force=args.force)
+                f_out, tmp_path = create_secure_temp_file(out_path)
+
+            pwd_bytes = get_password_bytes(args, is_confirm_needed=False)
+
+            try:
+                with open(target_path, 'rb') as f_in:
+                    f_in.seek(-16, os.SEEK_END)
+                    tag = f_in.read(16)
+                    
+                    f_in.seek(HEADER_SIZE)
+                    
+                    key = get_key(pwd_bytes, salt, n, r, p)
+                    cipher = Cipher(algorithms.AES(key), modes.GCM(nonce, tag))
+                    decryptor = cipher.decryptor()
+                    decryptor.authenticate_additional_data(header_data)
+
+                    total_data = file_size - HEADER_SIZE - 16
+                    bytes_left = total_data
+                    processed = 0
+                    
+                    while bytes_left > 0:
+                        chunk_size = min(CHUNK_SIZE, bytes_left)
+                        chunk = f_in.read(chunk_size)
+                        f_out.write(decryptor.update(chunk))
+                        processed += len(chunk)
+                        bytes_left -= len(chunk)
+                        print_progress(processed, total_data)
+                        
+                    sys.stderr.write('\n')
+                    decryptor.finalize()
+                    
+                if f_out is not sys.stdout.buffer:
+                    f_out.close()
+                    
+                if tmp_path:
+                    os.replace(tmp_path, out_path)
+                    log(f"Decryption completed. Restored: '{out_path}'")
+                    if flag_is_dir == 1:
+                        log(f"Note: the original target was a directory. It has been restored as archive '{out_path}'.")
+                
+            except InvalidTag:
+                if f_out is not sys.stdout.buffer and not f_out.closed: f_out.close()
+                if tmp_path and os.path.exists(tmp_path): os.remove(tmp_path)
+                log("\nAccess denied: incorrect password/keyfile, or tampered file (Header/Data corrupted).")
+                sys.exit(1)
+            except (Exception, KeyboardInterrupt) as e:
+                if f_out is not sys.stdout.buffer and not f_out.closed: f_out.close()
+                if tmp_path and os.path.exists(tmp_path): os.remove(tmp_path)
+                log(f"\nDecryption aborted: {e}")
+                sys.exit(1)
         finally:
             if spool_file_path and os.path.exists(spool_file_path):
                 os.remove(spool_file_path)
