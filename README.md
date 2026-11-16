@@ -12,8 +12,8 @@ Single Python file, one dependency, works on any system with Python 3.
 - **Streaming & Pipes**: data is processed in 64 KB chunks. Use `-` as the target to encrypt/decrypt data streams directly via Unix pipes without touching the disk.
 - **File exclusion**: ignore specific files or directories during archiving using standard wildcard patterns (`-e`).
 - **Password or keyfile**: type a password (asked twice when encrypting) or use any file as a key with `-k`.
-- **Safe writes**: output goes to a temporary `.tmp` file and replaces the destination only after the operation succeeds. On errors or `Ctrl-C` the temporary file is removed.
-- **Overwrite protection**: asks before replacing an existing file, unless `-f` is given.
+- **Safe writes**: output goes to an atomic temporary file (`0600` permissions) in the destination directory and replaces the target only after the operation succeeds. On errors or `Ctrl-C` the temporary file is removed.
+- **Overwrite & symlink protection**: asks before replacing an existing file (unless `-f` is given), prevents overwriting the source file, and refuses to write to symbolic links or inside symlinked parent directories.
 - **Hardened decryption**: scrypt parameters read from the file are validated (`n` a power of two between 2^14 and 2^20, `r` 1-16, `p` 1-4) before any memory is allocated, so a crafted file cannot exhaust your RAM.
 - **Performance optimized**: smart I/O throttling on the progress bar maximizes NVMe disk speeds without terminal lag.
 
@@ -61,7 +61,7 @@ cifra [-h] [-v] [-f] [-o OUTPUT] [-k KEYFILE] [-e PATTERN] {encrypt,decrypt} tar
 | `-o`, `--output` | Specify an explicit output file path |
 | `-f`, `--force` | Overwrite existing output files without asking |
 | `-k`, `--keyfile` | Use the contents of a file as the key instead of a password |
-| `-e`, `--exclude` | Exclude files/directories matching this pattern (e.g. `*.log`) |
+| `-e`, `--exclude` | Exclude files/directories matching `fnmatch` pattern against basename or relative path (e.g. `*.log`) |
 | `-v`, `--version` | Show program's version number and exit |
 
 Notes about keyfiles:
@@ -74,19 +74,40 @@ Notes about keyfiles:
 
 ### Basic encryption and decryption
 
-```console
-$ cifra encrypt foo.bar
+```bash
+# Encrypt a single file (creates foo.bar.enc)
+cifra encrypt foo.bar
 
-$ cifra encrypt --exclude "*.log" /var/www/html
+# Decrypt the file back to its original name
+cifra decrypt foo.bar.enc
 
-$ cifra decrypt foo.bar.enc
+# Specify a custom output path and overwrite without asking
+cifra encrypt -f -o /mnt/backup/archive.enc /var/www/html
 ```
+
+### Exclude files when encrypting a directory
+
+```bash
+cifra encrypt --exclude "*.log" --exclude "html/cache/*" /var/www/html
+```
+
+Patterns use `fnmatch` glob syntax and are matched against both the file/directory basename (e.g. `*.log`, `node_modules`) and its relative archive path (e.g. `html/cache/*`).
 
 ### Use a keyfile instead of a password
 
 ```bash
 cifra encrypt -k my.key foo.bar
 cifra decrypt -k my.key foo.bar.enc
+```
+
+### Stream via Unix pipes (no intermediate files on disk)
+
+```bash
+# Compress and encrypt a directory on the fly
+tar -czf - /var/log/apache2 | cifra encrypt -k my.key - > logs.tar.gz.enc
+
+# Decrypt from a stream and extract immediately
+cifra decrypt -k my.key - < logs.tar.gz.enc | tar -xzf -
 ```
 
 ### Run without installing
