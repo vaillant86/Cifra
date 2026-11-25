@@ -203,6 +203,71 @@ class TestCifra(unittest.TestCase):
 
         self.assertEqual(dec_buf.getvalue(), plaintext)
 
+    def test_malformed_headers_and_scrypt_bounds(self):
+        # 1. Truncated file (< minimum header + tag size)
+        tiny_file = os.path.join(self.base, "tiny.enc")
+        with open(tiny_file, "wb") as f:
+            f.write(b"CFRA\x01\x00" + b"\x00" * 10)
+
+        with self.assertRaises(cifra.FormatError):
+            with open(tiny_file, "rb") as f:
+                cifra.parse_header(f, os.path.getsize(tiny_file))
+
+        # 2. Invalid magic bytes
+        bad_magic = os.path.join(self.base, "badmagic.enc")
+        raw_bad = b"NOPE" + b"\x00" * 62
+        with open(bad_magic, "wb") as f:
+            f.write(raw_bad)
+
+        with self.assertRaises(cifra.FormatError):
+            with open(bad_magic, "rb") as f:
+                cifra.parse_header(f, len(raw_bad))
+
+        # 3. Scrypt 'n' out of safe bounds (e.g. 2^25 = 32 GiB RAM DoS vector)
+        dos_header = cifra.pack_header_v1(
+            is_dir=False, n=(1 << 25), r=8, p=1, salt=b"\x11" * 16, nonce=b"\x22" * 12
+        )
+        dos_file = os.path.join(self.base, "dos.enc")
+        with open(dos_file, "wb") as f:
+            f.write(dos_header + b"\x00" * 32)
+
+        with self.assertRaises(cifra.FormatError):
+            with open(dos_file, "rb") as f:
+                cifra.parse_header(f, os.path.getsize(dos_file))
+
+        # 4. Non-power-of-two Scrypt 'n'
+        odd_n_header = cifra.pack_header_v1(
+            is_dir=False, n=20000, r=8, p=1, salt=b"\x11" * 16, nonce=b"\x22" * 12
+        )
+        odd_n_file = os.path.join(self.base, "oddn.enc")
+        with open(odd_n_file, "wb") as f:
+            f.write(odd_n_header + b"\x00" * 32)
+
+        with self.assertRaises(cifra.FormatError):
+            with open(odd_n_file, "rb") as f:
+                cifra.parse_header(f, os.path.getsize(odd_n_file))
+
+    def test_interrupted_write_leaves_no_temp_or_corrupt_output(self):
+        src = os.path.join(self.base, "large.bin")
+        enc = os.path.join(self.base, "large.bin.enc")
+        with open(src, "wb") as f:
+            f.write(b"A" * (cifra.CHUNK_SIZE * 4))
+
+        # Simulate KeyboardInterrupt mid-stream during ProgressBar.update
+        def boom_on_second_call(current, total):
+            if current > cifra.CHUNK_SIZE:
+                raise KeyboardInterrupt("Simulated Ctrl-C")
+
+        with patch.object(cifra.ProgressBar, "update", side_effect=boom_on_second_call):
+            with self.assertRaises(SystemExit) as cm:
+                cifra.main(["encrypt", "-k", self.keyfile, "-o", enc, src])
+            self.assertEqual(cm.exception.code, 130)
+
+        # Final output must not exist, and no leftover .tmp files should remain in self.base
+        self.assertFalse(os.path.exists(enc))
+        leftovers = [name for name in os.listdir(self.base) if name.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
+
 
 if __name__ == "__main__":
     unittest.main()

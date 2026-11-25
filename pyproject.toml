@@ -8,3 +8,9 @@ license = { text = "AGPL-3.0-or-later" }
 dependencies = [
     "cryptography>=41.0.0",
 ]
+
+[tool.setuptools]
+py-modules = ["cifra"]
+
+[project.scripts]
+cifra = "cifra:main"
