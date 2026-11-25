@@ -2,25 +2,25 @@
 
 A command-line tool to encrypt and decrypt files and directories with **AES-256-GCM**, using a key derived with **scrypt** from a password or a keyfile.
 
-Single Python file, one dependency, works on any system with Python 3.
+Single Python file, one dependency, works on Linux, macOS, and Windows with Python 3.8+.
 
 ## Features
 
-- **Strong authenticated encryption**: AES-256-GCM, so any wrong password or modified file is detected on decryption. The entire file header is also protected via Additional Authenticated Data (AAD).
+- **Strong authenticated encryption**: AES-256-GCM, so any wrong password or modified file is detected on decryption. The entire file header (`CFRA` v1, with backward read support for legacy `ENC2` files) is also protected via Additional Authenticated Data (AAD).
 - **Memory-hard key derivation**: scrypt (`n=2^17`, `r=8`, `p=1`, about 128 MiB of RAM) with a random 16-byte salt for every file.
-- **Files and directories**: a directory is archived with `tar` on the fly and encrypted in a single stream.
+- **Files and directories**: a directory is archived with `tar` on the fly and encrypted in a single stream (symbolic links and special files inside directories are safely skipped).
 - **Streaming & Pipes**: data is processed in 64 KB chunks. Use `-` as the target to encrypt/decrypt data streams directly via Unix pipes without touching the disk.
 - **File exclusion**: ignore specific files or directories during archiving using standard wildcard patterns (`-e`).
 - **Password or keyfile**: type a password (asked twice when encrypting) or use any file as a key with `-k`.
-- **Safe writes**: output goes to an atomic temporary file (`0600` permissions) in the destination directory and replaces the target only after the operation succeeds. On errors or `Ctrl-C` the temporary file is removed.
-- **Overwrite & symlink protection**: asks before replacing an existing file (unless `-f` is given), prevents overwriting the source file, and refuses to write to symbolic links or inside symlinked parent directories.
+- **Safe writes**: output goes to an atomic temporary file (`0600` permissions via `fchmod`) in the destination directory and replaces the target only after the operation succeeds. On errors or `Ctrl-C` the temporary file is removed.
+- **Overwrite, hardlink & symlink protection**: asks before replacing an existing file (unless `-f` is given), prevents overwriting the source file or its hard links, and refuses to write to symbolic links or inside any symlinked ancestor directory.
 - **Hardened decryption**: scrypt parameters read from the file are validated (`n` a power of two between 2^14 and 2^20, `r` 1-16, `p` 1-4) before any memory is allocated, so a crafted file cannot exhaust your RAM.
 - **Performance optimized**: smart I/O throttling on the progress bar maximizes NVMe disk speeds without terminal lag.
 
 ## Requirements
 
 - Python 3.8 or newer
-- The [`cryptography`](https://pypi.org/project/cryptography/) package
+- The [`cryptography`](https://pypi.org/project/cryptography/) package (`>= 41.0.0`)
 
 On Debian, Ubuntu or Linux Mint:
 
@@ -40,11 +40,17 @@ On Arch Linux or Manjaro:
 sudo pacman -S python-cryptography
 ```
 
-## Installation
+Or via `pip`:
 
 ```bash
-chmod +x cifra
-sudo mv cifra /usr/local/bin/
+pip install "cryptography>=41.0.0"
+```
+
+## Installation (Linux / macOS)
+
+```bash
+chmod +x cifra.py
+sudo cp cifra.py /usr/local/bin/cifra
 ```
 
 ## Usage
@@ -66,7 +72,7 @@ cifra [-h] [-v] [-f] [-o OUTPUT] [-k KEYFILE] [-e PATTERN] {encrypt,decrypt} tar
 
 Notes about keyfiles:
 
-- Max size of a readable keyfile is set to 4 MB and an empty keyfile is rejected.
+- The keyfile is read directly as raw key material (up to 4 MB) and passed straight to `scrypt` without pre-hashing; an empty keyfile is rejected.
 - Use a binary file, not a text file: if an editor changes even one byte (for example by adding a trailing newline), the key changes and you will not be able to decrypt.
 - Keep a backup copy. Without the keyfile the data cannot be recovered.
 
@@ -113,8 +119,14 @@ cifra decrypt -k my.key - < logs.tar.gz.enc | tar -xzf -
 ### Run without installing
 
 ```bash
-python3 cifra encrypt foo.bar
-python3 cifra decrypt foo.bar.enc
+python3 cifra.py encrypt foo.bar
+python3 cifra.py decrypt foo.bar.enc
+```
+
+## Running Tests
+
+```bash
+python3 -m unittest discover -v
 ```
 
 ## Limitations and security notes
@@ -126,6 +138,8 @@ python3 cifra decrypt foo.bar.enc
 - AES-GCM with a single nonce is limited to about 64 GiB per file.
 - With `-k` the keyfile alone is the secret. Anyone who holds that file can decrypt your data.
 - Directories are restored as `.tar` archives rather than extracted automatically. As with any tar file, only extract archives you trust.
+- Python strings and byte buffers are immutable and cannot be deterministically zeroed in memory after use.
+- Symbolic links and special files (FIFOs, sockets, device nodes) are skipped when archiving directories.
 
 ## License
 

@@ -1,0 +1,10 @@
+[project]
+name = "cifra"
+version = "1.4.0"
+description = "Command-line tool to encrypt and decrypt files and directories with AES-256-GCM and Scrypt."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "AGPL-3.0-or-later" }
+dependencies = [
+    "cryptography>=41.0.0",
+]

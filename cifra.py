@@ -5,9 +5,10 @@ import getpass
 import struct
 import tarfile
 import argparse
+import tempfile
+import stat
 import time
 import fnmatch
-import tempfile
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.exceptions import InvalidTag
@@ -15,16 +16,62 @@ from cryptography.exceptions import InvalidTag
 __version__ = "1.4.0"
 
 CHUNK_SIZE = 64 * 1024
-MAGIC_HEADER = b'ENC2'
 
-# Header format: 4B (magic) + 1B (is_dir) + 3x4B (n, r, p) + 16B (salt) + 12B (nonce)
-HEADER_FORMAT = '>4sBIII16s12s'
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # Total: 45 bytes
+# Current format: CFRA v1 (50 bytes total)
+# 4B (magic 'CFRA') + 1B (version=1) + 1B (is_dir) + 4B (reserved) + 3x4B (n, r, p) + 16B (salt) + 12B (nonce)
+MAGIC_CFRA = b'CFRA'
+FORMAT_VERSION = 1
+HEADER_V1_FORMAT = '>4sBB4sIII16s12s'
+HEADER_V1_SIZE = struct.calcsize(HEADER_V1_FORMAT)  # 50 bytes
+
+# Legacy format: ENC2 (45 bytes total, read-only compatibility)
+MAGIC_ENC2 = b'ENC2'
+HEADER_ENC2_FORMAT = '>4sBIII16s12s'
+HEADER_ENC2_SIZE = struct.calcsize(HEADER_ENC2_FORMAT)  # 45 bytes
+
+# KDF safety bounds (16 MiB to 1 GiB for r=8, p=1)
+MIN_SCRYPT_N = 16384    # 2^14
+MAX_SCRYPT_N = 1048576  # 2^20
+MIN_SCRYPT_R = 1
+MAX_SCRYPT_R = 16
+MIN_SCRYPT_P = 1
+MAX_SCRYPT_P = 4
 
 
-class UserAborted(Exception):
+class CifraError(Exception):
+    """Base exception for all Cifra domain errors."""
+    pass
+
+
+class PathValidationError(CifraError):
+    """Raised when input or output path checks fail security constraints."""
+    pass
+
+
+class FormatError(CifraError):
+    """Raised when file header, magic bytes, version, or KDF bounds are invalid."""
+    pass
+
+
+class AuthenticationError(CifraError):
+    """Raised when GCM tag verification fails (wrong password/keyfile or tampered data)."""
+    pass
+
+
+class UserAborted(CifraError):
     """Raised when the user declines an interactive confirmation."""
     pass
+
+
+def set_binary_stdio():
+    """Ensures stdin/stdout are in binary mode on Windows platforms."""
+    if os.name == 'nt':
+        import msvcrt
+        for stream in (sys.stdin, sys.stdout):
+            try:
+                msvcrt.setmode(stream.fileno(), os.O_BINARY)
+            except Exception:
+                pass
 
 
 def log(message):
@@ -36,6 +83,17 @@ def log(message):
 def get_key(pwd_bytes, salt, n, r, p):
     kdf = Scrypt(salt=salt, length=32, n=n, r=r, p=p)
     return kdf.derive(pwd_bytes)
+
+
+def validate_scrypt_params(n, r, p):
+    if not (n > 0 and (n & (n - 1)) == 0):
+        raise FormatError("Scrypt 'n' parameter is not a power of two (corrupted or tampered).")
+    if not (MIN_SCRYPT_N <= n <= MAX_SCRYPT_N):
+        raise FormatError(f"Scrypt 'n' ({n}) out of safe bounds [{MIN_SCRYPT_N}..{MAX_SCRYPT_N}].")
+    if not (MIN_SCRYPT_R <= r <= MAX_SCRYPT_R):
+        raise FormatError(f"Scrypt 'r' ({r}) out of safe bounds [{MIN_SCRYPT_R}..{MAX_SCRYPT_R}].")
+    if not (MIN_SCRYPT_P <= p <= MAX_SCRYPT_P):
+        raise FormatError(f"Scrypt 'p' ({p}) out of safe bounds [{MIN_SCRYPT_P}..{MAX_SCRYPT_P}].")
 
 
 class ProgressBar:
@@ -71,11 +129,12 @@ class ProgressBar:
             self.last_update = 0.0
 
 
-def should_exclude(path, excludes):
-    """Matches fnmatch patterns against both the basename and the relative path."""
-    name = os.path.basename(path)
+def should_exclude(rel_path, excludes):
+    """Matches fnmatch patterns against both the basename and the relative archive path."""
+    norm_rel = rel_path.replace(os.sep, '/')
+    name = os.path.basename(norm_rel)
     for pattern in excludes:
-        if fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(path, pattern):
+        if fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(norm_rel, pattern):
             return True
     return False
 
@@ -85,12 +144,31 @@ def get_target_size(path, excludes):
         return os.path.getsize(path)
 
     total = 0
-    for dirpath, dirnames, filenames in os.walk(path):
-        dirnames[:] = [d for d in dirnames if not should_exclude(os.path.join(dirpath, d), excludes)]
+    root_name = os.path.basename(os.path.abspath(path))
+    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+        rel_dir = os.path.relpath(dirpath, path)
+        arc_dir = root_name if rel_dir == '.' else os.path.join(root_name, rel_dir)
+
+        kept_dirs = []
+        for d in dirnames:
+            full_d = os.path.join(dirpath, d)
+            arc_d = os.path.join(arc_dir, d)
+            if os.path.islink(full_d) or should_exclude(arc_d, excludes):
+                continue
+            kept_dirs.append(d)
+        dirnames[:] = kept_dirs
+
         for f in filenames:
             fp = os.path.join(dirpath, f)
-            if not should_exclude(fp, excludes):
-                total += os.lstat(fp).st_size
+            arc_f = os.path.join(arc_dir, f)
+            if os.path.islink(fp) or should_exclude(arc_f, excludes):
+                continue
+            try:
+                st = os.lstat(fp)
+                if stat.S_ISREG(st.st_mode):
+                    total += st.st_size
+            except OSError:
+                pass
     return total
 
 
@@ -108,28 +186,46 @@ def same_file(a, b):
         return False
 
 
+def has_symlink_in_ancestors(target_path):
+    """Walks ancestor directories of target_path to detect any symlinked directory component."""
+    abs_path = os.path.abspath(target_path)
+    parent = os.path.dirname(abs_path)
+
+    # Check if the canonical path of the existing parent differs from its lexical path
+    # after resolving OS-level root aliases (e.g. /tmp -> /private/tmp on macOS)
+    cur = parent
+    while cur and cur != os.path.dirname(cur):
+        if os.path.islink(cur):
+            return cur
+        cur = os.path.dirname(cur)
+    return None
+
+
 def validate_output(out_path, target=None, force=False):
-    """Validates output path against symlinks, parent symlinks, directories, source clobbering, and overwrites."""
+    """Validates output path against symlinks, nested symlinked ancestors, directories, and source clobbering."""
     if not out_path:
-        raise ValueError("No output path was specified.")
+        raise PathValidationError("No output path was specified.")
 
     if os.path.islink(out_path):
-        raise ValueError(f"Refusing to write to symbolic link: '{out_path}'")
+        raise PathValidationError(f"Refusing to write to symbolic link: '{out_path}'")
+
+    symlink_ancestor = has_symlink_in_ancestors(out_path)
+    if symlink_ancestor:
+        raise PathValidationError(
+            f"Refusing to write inside symlinked ancestor directory: '{symlink_ancestor}'"
+        )
 
     out_path = os.path.abspath(out_path)
 
     if os.path.isdir(out_path):
-        raise ValueError(f"'{out_path}' is a directory.")
+        raise PathValidationError(f"'{out_path}' is a directory.")
 
     parent = os.path.dirname(out_path)
-    if os.path.islink(parent):
-        raise ValueError(f"Refusing to write inside symbolic link directory: '{parent}'")
-
     if not os.path.isdir(parent):
-        raise ValueError(f"Output directory '{parent}' does not exist.")
+        raise PathValidationError(f"Output directory '{parent}' does not exist.")
 
     if target and same_file(out_path, target):
-        raise ValueError("Output path refers to the source file.")
+        raise PathValidationError("Output path refers to the source file.")
 
     if os.path.lexists(out_path) and not force:
         if not sys.stdin.isatty():
@@ -181,7 +277,7 @@ class EncryptingStream:
         return len(data)
 
     def flush(self):
-        pass
+        self.out_f.flush()
 
     def close(self):
         pass
@@ -215,7 +311,57 @@ def get_password_bytes(keyfile, is_confirm_needed=False):
         return pwd1.encode('utf-8')
 
 
+def pack_header_v1(is_dir, n, r, p, salt, nonce):
+    return struct.pack(
+        HEADER_V1_FORMAT,
+        MAGIC_CFRA,
+        FORMAT_VERSION,
+        1 if is_dir else 0,
+        b'\x00\x00\x00\x00',
+        n,
+        r,
+        p,
+        salt,
+        nonce,
+    )
+
+
+def parse_header(f_in, file_size):
+    """Reads and validates CFRA v1 or legacy ENC2 header, returning (header_bytes, is_dir, n, r, p, salt, nonce)."""
+    if file_size < HEADER_ENC2_SIZE + 16:
+        raise FormatError("File is too small to contain valid encrypted data.")
+
+    magic = f_in.read(4)
+    if magic == b'ENC1':
+        raise FormatError("File created with legacy ENC1 format. Use an older release to decrypt.")
+
+    if magic == MAGIC_CFRA:
+        if file_size < HEADER_V1_SIZE + 16:
+            raise FormatError("File is too small for a valid CFRA v1 header.")
+        rest = f_in.read(HEADER_V1_SIZE - 4)
+        header_data = magic + rest
+        _, version, flag_is_dir, _reserved, n, r, p, salt, nonce = struct.unpack(
+            HEADER_V1_FORMAT, header_data
+        )
+        if version != FORMAT_VERSION:
+            raise FormatError(f"Unsupported CFRA format version: {version}.")
+    elif magic == MAGIC_ENC2:
+        rest = f_in.read(HEADER_ENC2_SIZE - 4)
+        header_data = magic + rest
+        _, flag_is_dir, n, r, p, salt, nonce = struct.unpack(
+            HEADER_ENC2_FORMAT, header_data
+        )
+    else:
+        raise FormatError("Invalid signature. The file was not encrypted with Cifra.")
+
+    validate_scrypt_params(n, r, p)
+    return header_data, flag_is_dir, n, r, p, salt, nonce
+
+
 def encrypt_target(target, is_stream, out_path, force, keyfile, excludes, progress):
+    if not is_stream and os.path.islink(target):
+        raise PathValidationError(f"Refusing to encrypt symbolic link directly: '{target}'")
+
     if is_stream:
         is_dir = False
         total_size = 0
@@ -250,20 +396,30 @@ def encrypt_target(target, is_stream, out_path, force, keyfile, excludes, progre
     encryptor = cipher.encryptor()
 
     try:
-        header = struct.pack(HEADER_FORMAT, MAGIC_HEADER, 1 if is_dir else 0, scrypt_n, scrypt_r, scrypt_p, salt, nonce)
+        header = pack_header_v1(is_dir, scrypt_n, scrypt_r, scrypt_p, salt, nonce)
         encryptor.authenticate_additional_data(header)
         f_out.write(header)
 
         if not is_stream and is_dir:
             stream = EncryptingStream(f_out, encryptor, total_size, progress)
+            skipped_special = []
 
             def tar_filter(tarinfo):
                 if should_exclude(tarinfo.name, excludes):
                     return None
+                if tarinfo.issym() or tarinfo.islnk():
+                    skipped_special.append(tarinfo.name)
+                    return None
+                if not (tarinfo.isreg() or tarinfo.isdir()):
+                    skipped_special.append(tarinfo.name)
+                    return None
                 return tarinfo
 
-            with tarfile.open(fileobj=stream, mode='w|') as tar:
-                tar.add(target, arcname=os.path.basename(target), filter=tar_filter)
+            with tarfile.open(fileobj=stream, mode='w|', dereference=False) as tar:
+                tar.add(target, arcname=os.path.basename(os.path.abspath(target)), filter=tar_filter)
+
+            if skipped_special:
+                log(f"\nNote: skipped {len(skipped_special)} symlink(s)/special file(s) during archiving.")
         else:
             processed = 0
             f_in = sys.stdin.buffer if is_stream else open(target, 'rb')
@@ -290,12 +446,12 @@ def encrypt_target(target, is_stream, out_path, force, keyfile, excludes, progre
             os.replace(tmp_path, out_path)
             log(f"Encryption completed. File created: '{out_path}'")
 
-    except (Exception, KeyboardInterrupt) as e:
+    except BaseException:
         if f_out is not sys.stdout.buffer and not f_out.closed:
             f_out.close()
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
-        raise RuntimeError(f"Encryption aborted: {e}") from e
+        raise
 
 
 def decrypt_target(target, is_stream, out_path, force, keyfile, progress):
@@ -325,25 +481,14 @@ def decrypt_target(target, is_stream, out_path, force, keyfile, progress):
     else:
         target_path = target
         if not os.path.isfile(target_path):
-            raise ValueError(f"Target '{target_path}' must be a file.")
+            raise PathValidationError(f"Target '{target_path}' must be a file.")
 
     try:
         file_size = os.path.getsize(target_path)
-        if file_size < HEADER_SIZE + 16:
-            raise ValueError("File is too small to contain valid encrypted data.")
-
         with open(target_path, 'rb') as f_in:
-            header_data = f_in.read(HEADER_SIZE)
-            magic, flag_is_dir, n, r, p, salt, nonce = struct.unpack(HEADER_FORMAT, header_data)
+            header_data, flag_is_dir, n, r, p, salt, nonce = parse_header(f_in, file_size)
 
-            if magic == b'ENC1':
-                raise ValueError("File created with an older version. Use the previous script.")
-            elif magic != MAGIC_HEADER:
-                raise ValueError("Invalid signature. The file was not encrypted with this program.")
-
-            if not (n > 0 and (n & (n - 1)) == 0) or not (16384 <= n <= 1048576) or not (1 <= r <= 16) or not (1 <= p <= 4):
-                raise ValueError("Scrypt parameters out of bounds (corrupted or tampered).")
-
+        header_len = len(header_data)
         tmp_path = None
 
         if is_stream and not out_path:
@@ -375,14 +520,14 @@ def decrypt_target(target, is_stream, out_path, force, keyfile, progress):
                 f_in.seek(-16, os.SEEK_END)
                 tag = f_in.read(16)
 
-                f_in.seek(HEADER_SIZE)
+                f_in.seek(header_len)
 
                 key = get_key(pwd_bytes, salt, n, r, p)
                 cipher = Cipher(algorithms.AES(key), modes.GCM(nonce, tag))
                 decryptor = cipher.decryptor()
                 decryptor.authenticate_additional_data(header_data)
 
-                total_data = file_size - HEADER_SIZE - 16
+                total_data = file_size - header_len - 16
                 bytes_left = total_data
                 processed = 0
 
@@ -411,19 +556,22 @@ def decrypt_target(target, is_stream, out_path, force, keyfile, progress):
                 f_out.close()
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
-            raise PermissionError("Access denied: incorrect password/keyfile, or tampered file (Header/Data corrupted).") from e
-        except (Exception, KeyboardInterrupt) as e:
+            raise AuthenticationError(
+                "Access denied: incorrect password/keyfile, or tampered file (Header/Data corrupted)."
+            ) from e
+        except BaseException:
             if f_out is not sys.stdout.buffer and not f_out.closed:
                 f_out.close()
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
-            raise RuntimeError(f"Decryption aborted: {e}") from e
+            raise
     finally:
         if spool_file_path and os.path.exists(spool_file_path):
             os.remove(spool_file_path)
 
 
-def main():
+def main(argv=None):
+    set_binary_stdio()
     parser = argparse.ArgumentParser(description="Cifra - encryption tool for files and directories.")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("action", choices=["encrypt", "decrypt"], help="Action to perform (encrypt or decrypt)")
@@ -438,7 +586,7 @@ def main():
         default=[],
         help="Exclude files/directories matching fnmatch glob pattern against basename or relative path (e.g. '*.log', 'dir/cache')",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     is_stream = (args.target == '-')
     progress = ProgressBar()
@@ -462,8 +610,11 @@ def main():
     except KeyboardInterrupt:
         log("\nOperation interrupted by user.")
         sys.exit(130)
-    except Exception as e:
-        log(f"\nError: {e}" if str(e).startswith("Access denied") else f"Error: {e}")
+    except AuthenticationError as e:
+        log(f"\nError: {e}")
+        sys.exit(2)
+    except (CifraError, FileNotFoundError, FileExistsError, ValueError, IOError, OSError) as e:
+        log(f"Error: {e}")
         sys.exit(1)
 
 
